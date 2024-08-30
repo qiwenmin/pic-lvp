@@ -3,6 +3,7 @@ from intelhex import IntelHex16bit
 from serial import Serial
 
 def read_dev_id(ser: Serial):
+    """暂时未实现"""
     pass
 
 def expect(ser: Serial, expected: bytes):
@@ -10,112 +11,59 @@ def expect(ser: Serial, expected: bytes):
     if actual!= expected:
         raise ValueError(f'Expected {expected!r}, got {actual!r}')
 
-def prog(ser: Serial, ih: IntelHex16bit):
+def exec_cmd(ser: Serial, cmd: bytes, expected: bytes = b'\x00\x00'):
+    ser.write(cmd)
+    expect(ser, expected)
+
+def enter_prog_mode(ser: Serial):
     # 进入bin模式
-    ser.write(b'.\r\n')
-    expect(ser, b'.\r\n')
+    exec_cmd(ser, b'.\r\n', b'.\r\n')
 
     # 进入编程模式
-    ser.write(b'p')
-    expect(ser, b'\x00\x00')
+    exec_cmd(ser, b'p')
 
-    ser.write(b'c')
-    expect(ser, b'\x00\x00')
+def exit_prog_mode(ser: Serial):
+    # 退出编程模式
+    exec_cmd(ser, b'q')
 
+    # 退出bin模式
+    exec_cmd(ser, b'x', b'\n> ')
+
+def load_config(ser: Serial):
+    exec_cmd(ser, b'c')
+
+def read_data(ser: Serial, length: int) -> bytes:
     ser.write(b'r')
-    ser.write(b'\x10')
-    ser.write(b'\x00')
+    ser.write(length.to_bytes(2, byteorder='little'))
     l = ser.read(2)
-    # print(l)
-    data = ser.read(l[0] + l[1] * 16)
-    # print(data)
-    print(f'Device ID: {hex(data[12] + data[13] * 256)}')
+    data = ser.read(l[0] + (l[1] << 8))
+    return data
 
-    # 擦除
-    ser.write(b'0')
-    expect(ser, b'\x00\x00')
+def reset_address(ser: Serial):
+    exec_cmd(ser, b'0')
 
-    ser.write(b'a')
-    expect(ser, b'\x00\x00')
+def erase_all(ser: Serial):
+    exec_cmd(ser, b'a')
 
-    # 写入数据
-    for start, end in ih.segments():
-        print(f'Writing segment {start//2:04x} - {end//2:04x}')
-        addr = start // 2
-        length = (end - start) // 2
-        if addr < 0x8000:
-            offset = addr
-            print(f'Writing {length} words at offset {offset}')
+def inc_address(ser: Serial, offset: int = 1):
+    for _ in range(offset):
+        exec_cmd(ser, b'i')
 
-            ser.write(b'0')
-            expect(ser, b'\x00\x00')
+def load_data(ser: Serial, data: int):
+    exec_cmd(ser, b'l' + data.to_bytes(2, byteorder='little'))
 
-            for i in range(offset):
-                ser.write(b'i')
-                expect(ser, b'\x00\x00')
+def write_flash(ser: Serial):
+    exec_cmd(ser, b'w')
 
-            for i in range(addr, addr+length):
-                data = ih[i] & 0x3fff
-                # print(hex(data))
-                bs = data.to_bytes(2, byteorder='little')
-                # print(bs)
-                ser.write(b'l')
-                ser.write(bs)
-                expect(ser, b'\x00\x00')
-                if (i + 1) % 16 == 0:
-                    ser.write(b'w')
-                    expect(ser, b'\x00\x00')
-                ser.write(b'i')
-                expect(ser, b'\x00\x00')
+def verify_data(ser: Serial, ih: IntelHex16bit):
+    reset_address(ser)
+    flash_data = read_data(ser, 0x0400)
+    print(f'Read {len(flash_data)} bytes of flash data')
 
-            if (addr + length) % 16 != 0:
-                ser.write(b'w')
-                expect(ser, b'\x00\x00')
-        else:
-            offset = addr - 0x8000
-            print(f'Writing {length} words at offset {offset}')
+    load_config(ser)
+    config_data = read_data(ser, 0x10)
 
-            ser.write(b'c')
-            expect(ser, b'\x00\x00')
-
-            for i in range(offset):
-                ser.write(b'i')
-                expect(ser, b'\x00\x00')
-
-            for i in range(length):
-                data = ih[addr+i] & 0x3fff
-                # print(hex(data))
-                bs = data.to_bytes(2, byteorder='little')
-                # print(bs)
-                ser.write(b'l')
-                ser.write(bs)
-                expect(ser, b'\x00\x00')
-                ser.write(b'w')
-                expect(ser, b'\x00\x00')
-                ser.write(b'i')
-                expect(ser, b'\x00\x00')
-
-    # 验证数据
-    ser.write(b'0')
-    expect(ser, b'\x00\x00')
-
-    ser.write(b'r')
-    ser.write(b'\x00')
-    ser.write(b'\x04')
-    l = ser.read(2)
-    count = l[0] + (l[1] << 8)
-    flash_data = ser.read(count)
-    print(f'Read {count} bytes of flash data')
-
-    ser.write(b'c')
-    expect(ser, b'\x00\x00')
-    ser.write(b'r')
-    ser.write(b'\x10')
-    ser.write(b'\x00')
-    l = ser.read(2)
-    count = l[0] + (l[1] << 8)
-    config_data = ser.read(count)
-    print(f'Read {count} bytes of config data')
+    print(f'Read {len(config_data)} bytes of config data')
 
     for start, end in ih.segments():
         print(f'Verifying segment {start//2:04x} - {end//2:04x}')
@@ -135,21 +83,79 @@ def prog(ser: Serial, ih: IntelHex16bit):
                 print(f'h_dat: {h_dat}')
                 print(f'c_dat: {c_dat}')
 
-    # 退出编程模式
-    ser.write(b'q')
-    expect(ser, b'\x00\x00')
+def flash_program(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
+    offset = addr
+    print(f'Writing {length} words at offset {offset}')
 
-    # 退出bin模式
-    ser.write(b'x')
-    expect(ser, b'\n> ')
+    reset_address(ser)
+    inc_address(ser, offset)
 
-    print(ih.segments())
+    for i in range(addr, addr+length):
+        data = ih[i] & 0x3fff
+        load_data(ser, data)
 
+        if (i + 1) % 16 == 0:
+            write_flash(ser)
+
+        inc_address(ser)
+
+    if (addr + length) % 16 != 0:
+        write_flash(ser)
+
+def flash_config(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
+    offset = addr - 0x8000
+    print(f'Writing {length} words at offset {offset}')
+
+    load_config(ser)
+
+    inc_address(ser, offset)
+
+    for i in range(length):
+        data = ih[addr+i] & 0x3fff
+
+        load_data(ser, data)
+        write_flash(ser)
+        inc_address(ser)
+
+def flash_hex(ser: Serial, ih: IntelHex16bit):
+    # 擦除
+    reset_address(ser)
+    erase_all(ser)
+
+    # 写入数据
+    for start, end in ih.segments():
+        print(f'Writing segment {start//2:04x} - {end//2:04x}')
+        addr = start // 2
+        length = (end - start) // 2
+        if addr < 0x8000:
+            flash_program(ser, addr, length, ih)
+        else:
+            flash_config(ser, addr, length, ih)
+
+def prog(ser: Serial, ih: IntelHex16bit):
+
+    enter_prog_mode(ser)
+
+    try:
+        load_config(ser)
+
+        data = read_data(ser, 0x10)
+
+        device_id = int.from_bytes(data[12:14], byteorder='little')
+        print(f'Device ID: {hex(device_id)}')
+
+        # 烧写数据
+        flash_hex(ser, ih)
+
+        # 验证数据
+        verify_data(ser, ih)
+
+    finally:
+        exit_prog_mode(ser)
 
 def main(port: str, hexfile: str):
     ih = IntelHex16bit(hexfile)
-    ser = Serial(port, 115200)
-
-    prog(ser, ih)
+    with Serial(port, 115200) as ser:
+        prog(ser, ih)
 
 argh.dispatch_command(main)
