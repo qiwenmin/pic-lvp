@@ -1,10 +1,9 @@
 import argh
 from intelhex import IntelHex16bit
 from serial import Serial
+from processors import processors
 
-def read_dev_id(ser: Serial):
-    """暂时未实现"""
-    pass
+VERSION = '0.1.0'
 
 def expect(ser: Serial, expected: bytes):
     actual = ser.read(len(expected))
@@ -55,35 +54,42 @@ def load_data(ser: Serial, data: int):
 def write_flash(ser: Serial):
     exec_cmd(ser, b'w')
 
-def verify_data(ser: Serial, ih: IntelHex16bit):
+def verify_data(ser: Serial, ih: IntelHex16bit, p: dict):
+    flash_size = p['flash_size']
+    config_size = p['config_size']
+    word_mask = p['word_mask']
+
     reset_address(ser)
-    flash_data = read_data(ser, 0x0400)
-    print(f'Read {len(flash_data)} bytes of flash data')
+    flash_data = read_data(ser, flash_size)
+    print(f'Read {len(flash_data)//2} words of flash data')
 
     load_config(ser)
-    config_data = read_data(ser, 0x10)
-
-    print(f'Read {len(config_data)} bytes of config data')
+    config_data = read_data(ser, config_size)
+    config_addr = p['config_address']
+    config_start = config_addr * 2
+    print(f'Read {len(config_data)//2} words of config data')
 
     for start, end in ih.segments():
         print(f'Verifying segment {start//2:04x} - {end//2:04x}')
-        if start < 0x10000:
+        if start < config_start:
             f_dat = flash_data[start:end]
             h_dat = ih.tobinstr(start, end-1)
             if f_dat != h_dat:
                 print('Flash data does not match hex file!')
         else:
             for i in range(start//2, end//2):
-                ih[i] = ih[i] & 0x3fff
+                ih[i] = ih[i] & word_mask
 
             h_dat = ih.tobinstr(start, end-1)
-            c_dat = config_data[start-0x10000:end-0x10000]
+            c_dat = config_data[start-config_start:end-config_start]
             if h_dat != c_dat:
                 print('Config data does not match hex file!')
                 print(f'h_dat: {h_dat}')
                 print(f'c_dat: {c_dat}')
 
-def flash_program(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
+def flash_program(ser: Serial, addr: int, length: int, ih: IntelHex16bit, p: dict):
+    word_mask = p['word_mask']
+
     offset = addr
     print(f'Writing {length} words at offset {offset}')
 
@@ -91,7 +97,7 @@ def flash_program(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
     inc_address(ser, offset)
 
     for i in range(addr, addr+length):
-        data = ih[i] & 0x3fff
+        data = ih[i] & word_mask
         load_data(ser, data)
 
         if (i + 1) % 16 == 0:
@@ -102,8 +108,11 @@ def flash_program(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
     if (addr + length) % 16 != 0:
         write_flash(ser)
 
-def flash_config(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
-    offset = addr - 0x8000
+def flash_config(ser: Serial, addr: int, length: int, ih: IntelHex16bit, p: dict):
+    config_address = p['config_address']
+    word_mask = p['word_mask']
+
+    offset = addr - config_address
     print(f'Writing {length} words at offset {offset}')
 
     load_config(ser)
@@ -111,13 +120,15 @@ def flash_config(ser: Serial, addr: int, length: int, ih: IntelHex16bit):
     inc_address(ser, offset)
 
     for i in range(length):
-        data = ih[addr+i] & 0x3fff
+        data = ih[addr+i] & word_mask
 
         load_data(ser, data)
         write_flash(ser)
         inc_address(ser)
 
-def flash_hex(ser: Serial, ih: IntelHex16bit):
+def flash_hex(ser: Serial, ih: IntelHex16bit, p: dict):
+    config_address = p['config_address']
+
     # 擦除
     reset_address(ser)
     erase_all(ser)
@@ -127,35 +138,78 @@ def flash_hex(ser: Serial, ih: IntelHex16bit):
         print(f'Writing segment {start//2:04x} - {end//2:04x}')
         addr = start // 2
         length = (end - start) // 2
-        if addr < 0x8000:
-            flash_program(ser, addr, length, ih)
+        if addr < config_address:
+            flash_program(ser, addr, length, ih, p)
         else:
-            flash_config(ser, addr, length, ih)
+            flash_config(ser, addr, length, ih, p)
 
-def prog(ser: Serial, ih: IntelHex16bit):
+def prog(ser: Serial, ih: IntelHex16bit, p: dict, verify_only: bool):
 
     enter_prog_mode(ser)
 
     try:
         load_config(ser)
 
-        data = read_data(ser, 0x10)
+        config_addr = p['config_address']
+        config_size = p['config_size']
 
-        device_id = int.from_bytes(data[12:14], byteorder='little')
-        print(f'Device ID: {hex(device_id)}')
+        data = read_data(ser, config_size)
+
+        (device_id_addr, device_id_mask, device_id_value) = p['device_id']
+        config_addr = p['config_address']
+
+        device_id_offset = (device_id_addr - config_addr) * 2
+
+        read_device_id = int.from_bytes(data[device_id_offset:device_id_offset+2], byteorder='little') & device_id_mask
+        if read_device_id != device_id_value:
+            print(f'Device ID mismatch. Expected {hex(device_id_value)}, got {hex(read_device_id)}')
+            raise ValueError('Device ID mismatch')
+
+        print(f'Device ID: {hex(read_device_id)}')
 
         # 烧写数据
-        flash_hex(ser, ih)
+        if not verify_only:
+            flash_hex(ser, ih, p)
 
         # 验证数据
-        verify_data(ser, ih)
+        verify_data(ser, ih, p)
 
+        #  成功
+        print('Done.')
+    except Exception as e:
+        print(f'Error: {e}')
     finally:
         exit_prog_mode(ser)
 
-def main(port: str, hexfile: str):
+@argh.arg('-P', '--port', help='Serial port')
+@argh.arg('-f', '--hexfile', help='Hex file')
+@argh.arg('-p', '--processor', help='Processor type')
+@argh.arg('-n', '--verify-only', help='Verify only', default=False, action='store_true')
+@argh.arg('-l', '--list-processors', help='List supported processors', default=False, action='store_true')
+def main(port: str = None, hexfile: str = None, processor: str = None, verify_only: bool = False, list_processors: bool = False):
+    print(f'pic-lvp programmer v{VERSION}')
+
+    if list_processors:
+        print('Supported processors:')
+        for p in processors:
+            print(f'- {p}')
+        return
+
+    if processor is None:
+        print('Processor not specified. Please specify processor type.')
+        return
+
+    p = processors.get(processor)
+    if p is None:
+        print(f'Processor {processor} not found.')
+        return
+
+    if (hexfile is None) or (port is None):
+        print('Hex file and serial port must be specified.')
+        return
+
     ih = IntelHex16bit(hexfile)
     with Serial(port, 115200) as ser:
-        prog(ser, ih)
+        prog(ser, ih, p, verify_only)
 
 argh.dispatch_command(main)
